@@ -12,30 +12,24 @@ import time
 TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_IDS = [int(os.getenv("ADMIN_ID"))]
 
-DATA_FILE = "schedule.json"
+DATA_DIR = "user_data"
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # Состояния для ConversationHandler
 WAITING_TITLE, WAITING_START, WAITING_END, WAITING_BEFORE = range(4)
 EDITING_TITLE, EDITING_START, EDITING_END, EDITING_BEFORE = range(4, 8)
+WAITING_USER_ID = 8
 
 def parse_time(time_str):
-    """Умный парсинг времени: 1430 -> 14:30, 14.30 -> 14:30 и т.д."""
-    # Удаляем всё кроме цифр
     digits = re.sub(r'\D', '', time_str)
-    
     if not digits:
         return None
-    
-    # Обработка разных вариантов
-    if len(digits) == 1:  # 2 -> 02:?? но не хватает минут
+    if len(digits) == 1 or len(digits) == 2:
         return None
-    if len(digits) == 2:  # 23 -> только часы, нет минут
-        return None
-    if len(digits) == 3:  # 230 -> 02:30
+    if len(digits) == 3:
         digits = '0' + digits
     if len(digits) >= 4:
-        digits = digits[:4]  # берём первые 4 цифры
-    
+        digits = digits[:4]
     if len(digits) == 4:
         hours = int(digits[:2])
         minutes = int(digits[2:])
@@ -43,10 +37,15 @@ def parse_time(time_str):
             return f"{hours:02d}:{minutes:02d}"
     return None
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, 'r') as f:
+def get_user_file(user_id):
+    return os.path.join(DATA_DIR, f"user_{user_id}.json")
+
+def load_user_data(user_id):
+    file_path = get_user_file(user_id)
+    if os.path.exists(file_path):
+        with open(file_path, 'r', encoding='utf-8') as f:
             return json.load(f)
+    # Новый пользователь — дефолтное расписание
     return {
         "enabled": True,
         "events": [
@@ -66,28 +65,29 @@ def load_data():
             {"id": 14, "time_start": "20:00", "time_end": "20:30", "title": "📘 Вечерний дневник", "notification_enabled": True, "notification_minutes_before": 5},
             {"id": 15, "time_start": "22:00", "time_end": "22:00", "title": "💤 Отбой", "notification_enabled": True, "notification_minutes_before": 15}
         ],
-        "users": [],
         "next_id": 16
     }
 
-def save_data(data):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+def save_user_data(user_id, data):
+    with open(get_user_file(user_id), 'w', encoding='utf-8') as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
-data = load_data()
 bot = None
-scheduled_jobs = {}
+user_schedules = {}  # user_id: {scheduled_jobs}
 
-def clear_schedule():
-    for job_id, job in scheduled_jobs.items():
-        schedule.cancel_job(job)
-    scheduled_jobs.clear()
+def clear_user_schedule(user_id):
+    if user_id in user_schedules:
+        for job in user_schedules[user_id]:
+            schedule.cancel_job(job)
+        user_schedules[user_id] = []
 
-def setup_schedule():
-    clear_schedule()
-    if not data.get("enabled", True):
+def setup_user_schedule(user_id, user_data):
+    clear_user_schedule(user_id)
+    if not user_data.get("enabled", True):
         return
-    for event in data["events"]:
+    
+    jobs = []
+    for event in user_data["events"]:
         if not event.get("notification_enabled", True):
             continue
         hour, minute = map(int, event["time_start"].split(':'))
@@ -100,18 +100,20 @@ def setup_schedule():
             if send_hour < 0:
                 send_hour = 23
         send_time = f"{send_hour:02d}:{send_minute:02d}"
-        job = schedule.every().day.at(send_time).do(lambda e=event: asyncio.run_coroutine_threadsafe(send_notification(e), asyncio.get_event_loop()))
-        scheduled_jobs[event["id"]] = job
+        job = schedule.every().day.at(send_time).do(
+            lambda e=event, uid=user_id: asyncio.run_coroutine_threadsafe(send_notification(uid, e), asyncio.get_event_loop())
+        )
+        jobs.append(job)
+    user_schedules[user_id] = jobs
 
-async def send_notification(event):
-    for user_id in data.get("users", []):
-        try:
-            before = event.get("notification_minutes_before", 0)
-            before_text = f" (за {before} мин)" if before > 0 else ""
-            text = f"🔔 {event['title']}{before_text}\n⏰ {event['time_start']} - {event['time_end']}\n📝 Не забудьте!"
-            await bot.send_message(chat_id=user_id, text=text)
-        except:
-            pass
+async def send_notification(user_id, event):
+    try:
+        before = event.get("notification_minutes_before", 0)
+        before_text = f" (за {before} мин)" if before > 0 else ""
+        text = f"🔔 {event['title']}{before_text}\n⏰ {event['time_start']} - {event['time_end']}\n📝 Не забудьте!"
+        await bot.send_message(chat_id=user_id, text=text)
+    except:
+        pass
 
 def run_scheduler():
     while True:
@@ -120,36 +122,36 @@ def run_scheduler():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id in ADMIN_IDS:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📅 Распорядок", callback_data="show_schedule")],
-            [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_choice")],
-            [InlineKeyboardButton("➕ Добавить событие", callback_data="add_event")],
-            [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
-        ])
-        await update.message.reply_text("🤖 *Бот распорядка дня*\n\nВыберите действие:", reply_markup=kb, parse_mode="Markdown")
-    else:
-        if user_id not in data["users"]:
-            data["users"].append(user_id)
-            save_data(data)
-            await update.message.reply_text("✅ Вы добавлены в список уведомлений!")
-            setup_schedule()
+    
+    # Загружаем или создаём данные пользователя
+    user_data = load_user_data(user_id)
+    save_user_data(user_id, user_data)
+    setup_user_schedule(user_id, user_data)
+    
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📅 Распорядок", callback_data="show_schedule")],
+        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
+    ])
+    await update.message.reply_text("🤖 *Бот распорядка дня*\n\nВыберите действие:", reply_markup=kb, parse_mode="Markdown")
 
 async def show_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
+    
     text = "📅 *РАСПОРЯДОК ДНЯ*\n\n"
-    for e in data["events"]:
+    for e in user_data["events"]:
         icon = "🔔" if e.get("notification_enabled", True) else "🔕"
         before = e.get("notification_minutes_before", 0)
         before_text = f" (за {before} мин)" if before > 0 else ""
         text += f"{icon} *{e['title']}*\n   ⏰ {e['time_start']} - {e['time_end']}{before_text}\n\n"
     
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✏️ Редактировать событие", callback_data="edit_choice")],
+        [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_choice")],
         [InlineKeyboardButton("➕ Добавить событие", callback_data="add_event")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton("◀️ Главное меню", callback_data="main_menu")]
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="main_menu")]
     ])
     await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
 
@@ -159,16 +161,19 @@ async def edit_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("✏️ Редактировать событие", callback_data="edit_event_list")],
         [InlineKeyboardButton("🗑️ Удалить событие", callback_data="delete_event_list")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
+        [InlineKeyboardButton("◀️ Назад", callback_data="show_schedule")]
     ])
     await query.edit_message_text("Выберите действие:", reply_markup=kb)
 
 async def list_events_for_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     action = query.data.split("_")[0]
+    
     buttons = []
-    for event in data["events"]:
+    for event in user_data["events"]:
         buttons.append([InlineKeyboardButton(f"{event['time_start']} - {event['title'][:30]}", callback_data=f"{action}_event_{event['id']}")])
     buttons.append([InlineKeyboardButton("◀️ Назад", callback_data="edit_choice")])
     kb = InlineKeyboardMarkup(buttons)
@@ -178,8 +183,11 @@ async def list_events_for_edit(update: Update, context: ContextTypes.DEFAULT_TYP
 async def edit_event_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     event_id = int(query.data.split("_")[2])
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
+    event = next((e for e in user_data["events"] if e["id"] == event_id), None)
+    
     if not event:
         await query.edit_message_text("❌ Событие не найдено")
         return
@@ -209,8 +217,11 @@ async def edit_event_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def delete_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     event_id = int(query.data.split("_")[2])
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
+    event = next((e for e in user_data["events"] if e["id"] == event_id), None)
+    
     if not event:
         await query.edit_message_text("❌ Событие не найдено")
         return
@@ -224,27 +235,28 @@ async def delete_event_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     event_id = int(query.data.split("_")[2])
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
-    if event:
-        data["events"] = [e for e in data["events"] if e["id"] != event_id]
-        save_data(data)
-        setup_schedule()
-        await query.edit_message_text(f"✅ Событие \"{event['title']}\" удалено")
-    else:
-        await query.edit_message_text("❌ Ошибка")
+    
+    user_data["events"] = [e for e in user_data["events"] if e["id"] != event_id]
+    save_user_data(user_id, user_data)
+    setup_user_schedule(user_id, user_data)
+    
+    await query.edit_message_text(f"✅ Событие удалено")
+    # Показываем распорядок
+    await show_schedule(update, context)
 
-# Conversation для добавления события
 async def add_event_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="main_menu")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="show_schedule")]])
     await query.edit_message_text("📝 *Добавление события*\n\nВведите НАЗВАНИЕ события:", reply_markup=kb, parse_mode="Markdown")
     return WAITING_TITLE
 
 async def add_event_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_title"] = update.message.text
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="main_menu")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="show_schedule")]])
     await update.message.reply_text("⏰ *Введите время начала*\n\nПоддерживаются форматы:\n• 14:30\n• 1430\n• 14.30\n• 14 30\n\nПример: 1430", reply_markup=kb, parse_mode="Markdown")
     return WAITING_START
 
@@ -254,11 +266,11 @@ async def add_event_start_time(update: Update, context: ContextTypes.DEFAULT_TYP
     
     if parsed_time:
         context.user_data["new_start"] = parsed_time
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="main_menu")]])
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="show_schedule")]])
         await update.message.reply_text("⏰ *Введите время окончания*\n\nПоддерживаются форматы:\n• 15:30\n• 1530\n• 15.30\n• 15 30\n\nПример: 1530", reply_markup=kb, parse_mode="Markdown")
         return WAITING_END
     else:
-        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 14:30\n• 1430\n• 14.30\n• 14 30\n\nПример: 1430")
+        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 14:30\n• 1430\n• 14.30\n• 14 30")
         return WAITING_START
 
 async def add_event_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -273,21 +285,24 @@ async def add_event_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE)
             [InlineKeyboardButton("10 мин", callback_data="before_10")],
             [InlineKeyboardButton("15 мин", callback_data="before_15")],
             [InlineKeyboardButton("30 мин", callback_data="before_30")],
-            [InlineKeyboardButton("◀️ Отмена", callback_data="main_menu")]
+            [InlineKeyboardButton("◀️ Отмена", callback_data="show_schedule")]
         ])
         await update.message.reply_text("🔔 *За сколько минут прислать уведомление?*", reply_markup=kb, parse_mode="Markdown")
         return WAITING_BEFORE
     else:
-        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 15:30\n• 1530\n• 15.30\n• 15 30\n\nПример: 1530")
+        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 15:30\n• 1530\n• 15.30\n• 15 30")
         return WAITING_END
 
 async def add_event_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
+    
     before = int(query.data.split("_")[1])
     
-    new_id = data["next_id"]
-    data["next_id"] += 1
+    new_id = user_data["next_id"]
+    user_data["next_id"] += 1
     
     new_event = {
         "id": new_id,
@@ -298,59 +313,32 @@ async def add_event_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "notification_minutes_before": before
     }
     
-    data["events"].append(new_event)
-    save_data(data)
-    setup_schedule()
+    user_data["events"].append(new_event)
+    save_user_data(user_id, user_data)
+    setup_user_schedule(user_id, user_data)
     
-    await query.edit_message_text(f"✅ Событие \"{new_event['title']}\" добавлено!\n⏰ {new_event['time_start']} - {new_event['time_end']}\n🔔 Уведомление за {before} мин")
-    
-    # Показываем главное меню
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Распорядок", callback_data="show_schedule")],
-        [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_choice")],
-        [InlineKeyboardButton("➕ Добавить событие", callback_data="add_event")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
-    ])
-    await query.message.reply_text("🤖 Главное меню", reply_markup=kb)
+    await query.edit_message_text(f"✅ Событие \"{new_event['title']}\" добавлено!")
+    await show_schedule(update, context)
     return ConversationHandler.END
 
-async def cancel_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        query = update.callback_query
-        await query.answer()
-        await query.edit_message_text("❌ Добавление отменено")
-    else:
-        await update.message.reply_text("❌ Добавление отменено")
-    
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📅 Распорядок", callback_data="show_schedule")],
-        [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_choice")],
-        [InlineKeyboardButton("➕ Добавить событие", callback_data="add_event")],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
-    ])
-    if update.callback_query:
-        await update.callback_query.message.reply_text("🤖 Главное меню", reply_markup=kb)
-    else:
-        await update.message.reply_text("🤖 Главное меню", reply_markup=kb)
-    return ConversationHandler.END
-
-# Редактирование полей через Conversation
 async def edit_title_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     event_id = int(query.data.split("_")[2])
-    context.user_data["editing_field"] = "title"
     context.user_data["editing_event_id"] = event_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="cancel_edit")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="edit_choice")]])
     await query.edit_message_text("📝 Введите новое название события:", reply_markup=kb)
     return EDITING_TITLE
 
 async def edit_title_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     event_id = context.user_data["editing_event_id"]
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
+    event = next((e for e in user_data["events"] if e["id"] == event_id), None)
+    
     if event:
         event["title"] = update.message.text
-        save_data(data)
+        save_user_data(user_id, user_data)
         await update.message.reply_text(f"✅ Название изменено на: {event['title']}")
     else:
         await update.message.reply_text("❌ Ошибка")
@@ -361,60 +349,62 @@ async def edit_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     event_id = int(query.data.split("_")[2])
-    context.user_data["editing_field"] = "start"
     context.user_data["editing_event_id"] = event_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="cancel_edit")]])
-    await query.edit_message_text("⏰ *Введите новое время начала*\n\nПоддерживаются форматы:\n• 14:30\n• 1430\n• 14.30\n• 14 30\n\nПример: 1430", reply_markup=kb, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="edit_choice")]])
+    await query.edit_message_text("⏰ *Введите новое время начала*\n\nПоддерживаются форматы:\n• 14:30\n• 1430\n• 14.30\n• 14 30", reply_markup=kb, parse_mode="Markdown")
     return EDITING_START
 
 async def edit_start_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     time_str = update.message.text.strip()
     parsed_time = parse_time(time_str)
     
     if parsed_time:
         event_id = context.user_data["editing_event_id"]
-        event = next((e for e in data["events"] if e["id"] == event_id), None)
+        event = next((e for e in user_data["events"] if e["id"] == event_id), None)
         if event:
             event["time_start"] = parsed_time
-            save_data(data)
-            setup_schedule()
+            save_user_data(user_id, user_data)
+            setup_user_schedule(user_id, user_data)
             await update.message.reply_text(f"✅ Время начала изменено на: {event['time_start']}")
         else:
             await update.message.reply_text("❌ Ошибка")
         await edit_event_menu(update, context)
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 14:30\n• 1430\n• 14.30\n• 14 30")
+        await update.message.reply_text("❌ Не удалось распознать время")
         return EDITING_START
 
 async def edit_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     event_id = int(query.data.split("_")[2])
-    context.user_data["editing_field"] = "end"
     context.user_data["editing_event_id"] = event_id
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="cancel_edit")]])
-    await query.edit_message_text("⏰ *Введите новое время окончания*\n\nПоддерживаются форматы:\n• 15:30\n• 1530\n• 15.30\n• 15 30\n\nПример: 1530", reply_markup=kb, parse_mode="Markdown")
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="edit_choice")]])
+    await query.edit_message_text("⏰ *Введите новое время окончания*\n\nПоддерживаются форматы:\n• 15:30\n• 1530\n• 15.30\n• 15 30", reply_markup=kb, parse_mode="Markdown")
     return EDITING_END
 
 async def edit_end_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     time_str = update.message.text.strip()
     parsed_time = parse_time(time_str)
     
     if parsed_time:
         event_id = context.user_data["editing_event_id"]
-        event = next((e for e in data["events"] if e["id"] == event_id), None)
+        event = next((e for e in user_data["events"] if e["id"] == event_id), None)
         if event:
             event["time_end"] = parsed_time
-            save_data(data)
-            setup_schedule()
+            save_user_data(user_id, user_data)
+            setup_user_schedule(user_id, user_data)
             await update.message.reply_text(f"✅ Время окончания изменено на: {event['time_end']}")
         else:
             await update.message.reply_text("❌ Ошибка")
         await edit_event_menu(update, context)
         return ConversationHandler.END
     else:
-        await update.message.reply_text("❌ Не удалось распознать время.\n\nПожалуйста, введите время в одном из форматов:\n• 15:30\n• 1530\n• 15.30\n• 15 30")
+        await update.message.reply_text("❌ Не удалось распознать время")
         return EDITING_END
 
 async def edit_before_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -436,15 +426,18 @@ async def edit_before_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def set_before_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
+    
     parts = query.data.split("_")
     event_id = int(parts[2])
     before = int(parts[3])
     
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
+    event = next((e for e in user_data["events"] if e["id"] == event_id), None)
     if event:
         event["notification_minutes_before"] = before
-        save_data(data)
-        setup_schedule()
+        save_user_data(user_id, user_data)
+        setup_user_schedule(user_id, user_data)
         await query.edit_message_text(f"✅ Уведомление настроено: {'точно в время' if before == 0 else f'за {before} мин'}")
     else:
         await query.edit_message_text("❌ Ошибка")
@@ -455,12 +448,15 @@ async def set_before_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def toggle_notification(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
     event_id = int(query.data.split("_")[2])
-    event = next((e for e in data["events"] if e["id"] == event_id), None)
+    event = next((e for e in user_data["events"] if e["id"] == event_id), None)
+    
     if event:
         event["notification_enabled"] = not event.get("notification_enabled", True)
-        save_data(data)
-        setup_schedule()
+        save_user_data(user_id, user_data)
+        setup_user_schedule(user_id, user_data)
         status = "включены" if event["notification_enabled"] else "выключены"
         await query.edit_message_text(f"✅ Уведомления для \"{event['title']}\" {status}")
     else:
@@ -470,58 +466,74 @@ async def toggle_notification(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def settings_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    status = "🟢 ВКЛЮЧЕНЫ" if data["enabled"] else "🔴 ВЫКЛЮЧЕНЫ"
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
+    
+    status = "🟢 ВКЛЮЧЕНЫ" if user_data["enabled"] else "🔴 ВЫКЛЮЧЕНЫ"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{'🔴' if data['enabled'] else '🟢'} {'ВЫКЛЮЧИТЬ ВСЕ' if data['enabled'] else 'ВКЛЮЧИТЬ ВСЕ'}", callback_data="toggle_global")],
-        [InlineKeyboardButton("👥 Пользователи", callback_data="users_list")],
-        [InlineKeyboardButton("◀️ Назад", callback_data="main_menu")]
+        [InlineKeyboardButton(f"{'🔴' if user_data['enabled'] else '🟢'} {'ВЫКЛЮЧИТЬ ВСЕ' if user_data['enabled'] else 'ВКЛЮЧИТЬ ВСЕ'}", callback_data="toggle_global")],
+        [InlineKeyboardButton("◀️ Назад", callback_data="show_schedule")]
     ])
-    await query.edit_message_text(f"⚙️ *ОБЩИЕ НАСТРОЙКИ*\n\nУведомления: {status}\nПользователей: {len(data.get('users', []))}\n\n*Примечание:* Для каждого события можно отдельно включить/выключить уведомления в режиме редактирования.", reply_markup=kb, parse_mode="Markdown")
+    
+    # Добавляем кнопку добавления пользователя только для админа
+    if user_id in ADMIN_IDS:
+        kb.inline_keyboard.insert(1, [InlineKeyboardButton("➕ Добавить пользователя", callback_data="add_user_prompt")])
+    
+    await query.edit_message_text(f"⚙️ *НАСТРОЙКИ*\n\nУведомления: {status}\n\n*Примечание:* Для каждого события можно отдельно включить/выключить уведомления в режиме редактирования.", reply_markup=kb, parse_mode="Markdown")
+
+async def add_user_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text("📝 *Добавление пользователя*\n\nВведите Telegram ID пользователя (число):\n\nУзнать ID можно у @userinfobot", parse_mode="Markdown")
+    return WAITING_USER_ID
+
+async def add_user_by_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Нет прав")
+        return ConversationHandler.END
+    
+    try:
+        new_user_id = int(update.message.text.strip())
+        # Создаём файл пользователя с дефолтным расписанием
+        user_data = load_user_data(new_user_id)
+        save_user_data(new_user_id, user_data)
+        setup_user_schedule(new_user_id, user_data)
+        await update.message.reply_text(f"✅ Пользователь {new_user_id} добавлен! Он может написать боту /start")
+    except:
+        await update.message.reply_text("❌ Неверный ID. Введите число.")
+        return WAITING_USER_ID
+    
+    await settings_menu(update, context)
+    return ConversationHandler.END
 
 async def toggle_global(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data["enabled"] = not data["enabled"]
-    save_data(data)
-    if data["enabled"]:
-        setup_schedule()
+    user_id = update.effective_user.id
+    user_data = load_user_data(user_id)
+    
+    user_data["enabled"] = not user_data["enabled"]
+    save_user_data(user_id, user_data)
+    
+    if user_data["enabled"]:
+        setup_user_schedule(user_id, user_data)
         await query.edit_message_text("✅ Уведомления ВКЛЮЧЕНЫ")
     else:
-        clear_schedule()
+        clear_user_schedule(user_id)
         await query.edit_message_text("❌ Уведомления ВЫКЛЮЧЕНЫ")
+    
     await asyncio.sleep(1.5)
     await settings_menu(update, context)
-
-async def users_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    text = "👥 *ПОЛЬЗОВАТЕЛИ ПОЛУЧАЮЩИЕ УВЕДОМЛЕНИЯ*\n\n"
-    if data.get("users"):
-        for i, uid in enumerate(data["users"], 1):
-            text += f"{i}. ID: `{uid}`\n"
-    else:
-        text += "Нет пользователей\n\n"
-    text += "\n*Как добавить:*\nЧеловек должен написать боту /start"
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="settings")]])
-    await query.edit_message_text(text, reply_markup=kb, parse_mode="Markdown")
 
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Распорядок", callback_data="show_schedule")],
-        [InlineKeyboardButton("✏️ Редактировать", callback_data="edit_choice")],
-        [InlineKeyboardButton("➕ Добавить событие", callback_data="add_event")],
         [InlineKeyboardButton("⚙️ Настройки", callback_data="settings")]
     ])
     await query.edit_message_text("🤖 *Бот распорядка дня*\n\nВыберите действие:", reply_markup=kb, parse_mode="Markdown")
-
-async def cancel_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text("❌ Редактирование отменено")
-    await main_menu(update, context)
-    return ConversationHandler.END
 
 def main():
     global bot
@@ -537,46 +549,47 @@ def main():
             WAITING_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_event_end_time)],
             WAITING_BEFORE: [CallbackQueryHandler(add_event_before, pattern="^before_")]
         },
-        fallbacks=[CallbackQueryHandler(cancel_add, pattern="^main_menu$"), CommandHandler("cancel", cancel_add)]
+        fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern="^show_schedule$")]
     )
     
-    # ConversationHandler для редактирования названия
     edit_title_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_title_start, pattern="^edit_title_")],
         states={EDITING_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_title_input)]},
-        fallbacks=[CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"), CommandHandler("cancel", cancel_edit)]
+        fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern="^edit_choice$")]
     )
     
-    # ConversationHandler для редактирования времени начала
     edit_start_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_start_time, pattern="^edit_start_")],
         states={EDITING_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_start_input)]},
-        fallbacks=[CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"), CommandHandler("cancel", cancel_edit)]
+        fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern="^edit_choice$")]
     )
     
-    # ConversationHandler для редактирования времени окончания
     edit_end_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_end_time, pattern="^edit_end_")],
         states={EDITING_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, edit_end_input)]},
-        fallbacks=[CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"), CommandHandler("cancel", cancel_edit)]
+        fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern="^edit_choice$")]
     )
     
-    # ConversationHandler для редактирования задержки уведомления
     edit_before_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(edit_before_menu, pattern="^edit_before_")],
         states={EDITING_BEFORE: [CallbackQueryHandler(set_before_value, pattern="^set_before_")]},
-        fallbacks=[CallbackQueryHandler(cancel_edit, pattern="^cancel_edit$"), CommandHandler("cancel", cancel_edit)]
+        fallbacks=[CallbackQueryHandler(lambda u,c: ConversationHandler.END, pattern="^edit_choice$")]
     )
     
-    # Добавляем обработчики
+    add_user_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(add_user_prompt, pattern="^add_user_prompt$")],
+        states={WAITING_USER_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_user_by_id)]},
+        fallbacks=[CommandHandler("cancel", lambda u,c: ConversationHandler.END)]
+    )
+    
     app.add_handler(CommandHandler("start", start))
     app.add_handler(add_conv)
     app.add_handler(edit_title_conv)
     app.add_handler(edit_start_conv)
     app.add_handler(edit_end_conv)
     app.add_handler(edit_before_conv)
+    app.add_handler(add_user_conv)
     
-    # Callback кнопки
     app.add_handler(CallbackQueryHandler(main_menu, pattern="^main_menu$"))
     app.add_handler(CallbackQueryHandler(show_schedule, pattern="^show_schedule$"))
     app.add_handler(CallbackQueryHandler(edit_choice, pattern="^edit_choice$"))
@@ -588,11 +601,8 @@ def main():
     app.add_handler(CallbackQueryHandler(toggle_notification, pattern="^toggle_notif_\\d+$"))
     app.add_handler(CallbackQueryHandler(settings_menu, pattern="^settings$"))
     app.add_handler(CallbackQueryHandler(toggle_global, pattern="^toggle_global$"))
-    app.add_handler(CallbackQueryHandler(users_list, pattern="^users_list$"))
-    app.add_handler(CallbackQueryHandler(cancel_add, pattern="^cancel_add$"))
     
-    # Запуск планировщика
-    setup_schedule()
+    # Запуск планировщика в отдельном потоке
     scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
     scheduler_thread.start()
     
